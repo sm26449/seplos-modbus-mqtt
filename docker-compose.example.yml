@@ -1,0 +1,67 @@
+#######################################
+# Seplos BMS MQTT - Docker Compose Example
+#######################################
+#
+# Usage:
+#   cp docker-compose.example.yml docker-compose.yml
+#   # Edit docker-compose.yml with your settings
+#   docker-compose up -d
+#
+
+services:
+  seplos-bms-mqtt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: seplos-bms-mqtt:v2.5
+    container_name: seplos-bms-mqtt
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - ${SERIAL_PORT:-/dev/ttyUSB0}:${SERIAL_PORT:-/dev/ttyUSB0}
+    environment:
+      # Serial settings
+      - SERIAL_PORT=${SERIAL_PORT:-/dev/ttyUSB0}
+      - SERIAL_BAUDRATE=${SERIAL_BAUDRATE:-19200}
+      # MQTT settings
+      - MQTT_SERVER=${MQTT_SERVER:-localhost}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_USERNAME=${MQTT_USERNAME:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - MQTT_PREFIX=${MQTT_PREFIX:-seplos}
+      - MQTT_PUBLISH_MODE=${MQTT_PUBLISH_MODE:-changed}
+      # InfluxDB settings (optional)
+      - INFLUXDB_ENABLED=${INFLUXDB_ENABLED:-false}
+      - INFLUXDB_URL=${INFLUXDB_URL:-http://localhost:8086}
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-}
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-seplos}
+      - INFLUXDB_WRITE_INTERVAL=${INFLUXDB_WRITE_INTERVAL:-5}
+      - INFLUXDB_PUBLISH_MODE=${INFLUXDB_PUBLISH_MODE:-changed}
+      # Health settings
+      - HEALTH_CHECK_INTERVAL=${HEALTH_CHECK_INTERVAL:-60}
+      - HEALTH_STALE_TIMEOUT=${HEALTH_STALE_TIMEOUT:-120}
+      # General settings
+      - GENERAL_LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      # Optional: mount config file (can use env vars instead)
+      - ${DOCKER_ROOT:-/opt/docker}/seplos-bms-mqtt/config/seplos_bms_mqtt.ini:/app/seplos_bms_mqtt.ini:ro
+    healthcheck:
+      test: ["CMD", "python3", "/app/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Required setup:
+# 1. Copy this file: cp docker-compose.example.yml docker-compose.yml
+# 2. Create config directory: mkdir -p ${DOCKER_ROOT:-/opt/docker}/seplos-bms-mqtt/config
+# 3. Copy config file: cp seplos_bms_mqtt.ini.example ${DOCKER_ROOT:-/opt/docker}/seplos-bms-mqtt/config/seplos_bms_mqtt.ini
+# 4. Edit config OR set environment variables in .env file
+# 5. Build image: docker-compose build
+# 6. Start: docker-compose up -d
