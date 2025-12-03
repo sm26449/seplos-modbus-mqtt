@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2023 FerelArg
+Copyright (c) 2023 FerelArg (original Seplos3MQTT)
+Copyright (c) 2024 Stefan M <sm26449@diysolar.ro> (enhanced fork)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

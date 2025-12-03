@@ -226,13 +226,13 @@ class SerialSnooper:
             "dev": {
                 "ids": f"seplos_battery_{batt_number}",
                 "name": f"Seplos BMS {batt_number}",
-                "sw": "seplos-bms-mqtt 2.4",
+                "sw": "seplos-bms-mqtt 2.5",
                 "mdl": "Seplos BMSv3 MQTT",
                 "mf": "Seplos"
             },
             "origin": {
                 "name": "seplos-bms-mqtt",
-                "sw": "2.4",
+                "sw": "2.5",
                 "url": "https://github.com/sm2669/seplos-bms-mqtt"
             }
         }

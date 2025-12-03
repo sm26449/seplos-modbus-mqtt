@@ -88,6 +88,7 @@ class ConfigLoader:
             paths_to_try = [
                 self.config_path,
                 '/app/seplos_bms_mqtt.ini',
+                '/app/config/seplos_bms_mqtt.ini',  # Docker volume mount path
                 'seplos_bms_mqtt.ini',
                 os.path.join(os.path.dirname(__file__), '..', 'seplos_bms_mqtt.ini')
             ]

@@ -4,6 +4,8 @@ Pack Aggregator - calculates aggregate values for entire battery pack
 
 import time
 import json
+import threading
+from datetime import datetime, timezone
 from .logging_setup import get_logger
 
 
@@ -27,33 +29,39 @@ class PackAggregator:
         self.last_publish_time = 0
         self.publish_interval = 2
         self.log = get_logger()
+        self._lock = threading.Lock()  # Thread safety for batteries dict
 
     def update_battery_data(self, batt_id, data_type, value):
         """Update stored data for a battery"""
-        if batt_id not in self.batteries:
-            self.batteries[batt_id] = {}
-        self.batteries[batt_id][data_type] = value
-        self.batteries[batt_id]['last_update'] = time.time()
+        with self._lock:
+            if batt_id not in self.batteries:
+                self.batteries[batt_id] = {}
+            self.batteries[batt_id][data_type] = value
+            self.batteries[batt_id]['last_update'] = time.time()
 
     def get_battery_data(self, batt_id):
         """Get all data for a specific battery"""
-        return self.batteries.get(batt_id, {})
+        with self._lock:
+            return self.batteries.get(batt_id, {}).copy()
 
     def get_all_batteries(self):
         """Get all battery data"""
-        return self.batteries
+        with self._lock:
+            return {k: v.copy() for k, v in self.batteries.items()}
 
     def get_online_batteries(self, timeout=60):
         """Get batteries that have been updated within timeout seconds"""
         current_time = time.time()
-        return {k: v for k, v in self.batteries.items()
-                if current_time - v.get('last_update', 0) < timeout}
+        with self._lock:
+            return {k: v.copy() for k, v in self.batteries.items()
+                    if current_time - v.get('last_update', 0) < timeout}
 
     def get_stale_batteries(self, timeout=120):
         """Get batteries that haven't been updated within timeout seconds"""
         current_time = time.time()
-        return {k: v for k, v in self.batteries.items()
-                if current_time - v.get('last_update', 0) >= timeout}
+        with self._lock:
+            return {k: v.copy() for k, v in self.batteries.items()
+                    if current_time - v.get('last_update', 0) >= timeout}
 
     def autodiscovery_pack(self):
         """Send MQTT autodiscovery for pack aggregate sensors"""
@@ -98,6 +106,8 @@ class PackAggregator:
             # Current limits
             ("current", "measurement", "A", "Pack Max Discharge Current"),
             ("current", "measurement", "A", "Pack Max Charge Current"),
+            # Last update
+            ("timestamp", "", "", "Pack Last Update"),
         ]
 
         for dev_cla, state_class, unit, name in sensors:
@@ -119,13 +129,13 @@ class PackAggregator:
             "dev": {
                 "ids": "seplos_pack",
                 "name": "Seplos Battery Pack",
-                "sw": "seplos-bms-mqtt 2.4",
+                "sw": "seplos-bms-mqtt 2.5",
                 "mdl": "Seplos Pack Aggregate",
                 "mf": "Seplos"
             },
             "origin": {
                 "name": "seplos-bms-mqtt",
-                "sw": "2.4",
+                "sw": "2.5",
                 "url": "https://github.com/sm2669/seplos-bms-mqtt"
             }
         }
@@ -276,14 +286,18 @@ class PackAggregator:
         self.mqtt.publish_if_changed(f"{prefix}/pack_total_protections", sum(protection_counts))
         self.mqtt.publish_if_changed(f"{prefix}/pack_balancing_cells", sum(balancing_counts))
 
-        # Current limits (minimum across all batteries for safety)
+        # Current limits (SUM for parallel batteries)
         if max_discharge_curts:
-            self.mqtt.publish_if_changed(f"{prefix}/pack_max_discharge_current", min(max_discharge_curts))
+            self.mqtt.publish_if_changed(f"{prefix}/pack_max_discharge_current", sum(max_discharge_curts))
         if max_charge_curts:
-            self.mqtt.publish_if_changed(f"{prefix}/pack_max_charge_current", min(max_charge_curts))
+            self.mqtt.publish_if_changed(f"{prefix}/pack_max_charge_current", sum(max_charge_curts))
 
         # Status
         self.mqtt.publish_if_changed(f"{prefix}/pack_status", pack_status)
+
+        # Last update timestamp
+        last_update = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        self.mqtt.publish(f"{prefix}/pack_last_update", last_update, retain=True)
 
         # Write to InfluxDB if enabled
         if self.influxdb and self.influxdb.is_enabled():
@@ -317,8 +331,8 @@ class PackAggregator:
                 'total_alarms': sum(alarm_counts),
                 'total_protections': sum(protection_counts),
                 'balancing_cells': sum(balancing_counts),
-                'max_discharge_current': min(max_discharge_curts) if max_discharge_curts else None,
-                'max_charge_current': min(max_charge_curts) if max_charge_curts else None,
+                'max_discharge_current': sum(max_discharge_curts) if max_discharge_curts else None,
+                'max_charge_current': sum(max_charge_curts) if max_charge_curts else None,
                 'status': pack_status
             }
             self.influxdb.write_pack_data(pack_data)
