@@ -7,6 +7,13 @@ import threading
 import paho.mqtt.client as mqtt
 from .logging_setup import get_logger
 
+# Retry configuration
+RETRY_MAX_ATTEMPTS = 10
+RETRY_INITIAL_DELAY = 2  # seconds
+RETRY_MAX_DELAY = 60  # seconds
+RETRY_BACKOFF_FACTOR = 2
+RECONNECT_CHECK_INTERVAL = 30  # seconds
+
 
 class MQTTManager:
     """
@@ -51,6 +58,10 @@ class MQTTManager:
         # Command handler callback
         self._command_handler = None
         self._command_topic = f"R/{prefix}/#"
+
+        # Reconnection thread control
+        self._stop_reconnect = threading.Event()
+        self._reconnect_thread = None
 
         self._setup_client()
 
@@ -151,22 +162,79 @@ class MQTTManager:
         """Set custom command handler callback"""
         self._command_handler = handler
 
-    def connect(self):
-        """Connect to MQTT broker and start background loop"""
+    def _try_connect(self) -> bool:
+        """Attempt a single connection to MQTT broker"""
         try:
-            self.log.info(f"Connecting to MQTT server {self.server}:{self.port}")
             self.client.connect(self.server, self.port, keepalive=60)
-            # Start network loop in background thread (handles reconnection automatically)
             self.client.loop_start()
-            # Wait a bit for connection to establish
-            time.sleep(1)
+            # Wait briefly for connection
+            for _ in range(10):
+                if self.connected:
+                    break
+                time.sleep(0.1)
             return self.connected
         except Exception as e:
-            self.log.error(f"MQTT connection error: {e}")
+            self.log.warning(f"MQTT connection failed: {e}")
             return False
+
+    def connect(self):
+        """Connect to MQTT broker with retry logic"""
+        self.log.info(f"Connecting to MQTT server {self.server}:{self.port}")
+
+        delay = RETRY_INITIAL_DELAY
+
+        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+            if self._try_connect():
+                return True
+
+            if attempt < RETRY_MAX_ATTEMPTS:
+                self.log.info(
+                    f"MQTT connection attempt {attempt}/{RETRY_MAX_ATTEMPTS} failed, "
+                    f"retrying in {delay}s..."
+                )
+                time.sleep(delay)
+                delay = min(delay * RETRY_BACKOFF_FACTOR, RETRY_MAX_DELAY)
+
+        self.log.warning(
+            f"MQTT: all {RETRY_MAX_ATTEMPTS} connection attempts failed. "
+            "Will continue trying in background."
+        )
+        self._start_reconnect_thread()
+        return False
+
+    def _start_reconnect_thread(self):
+        """Start background thread for reconnection attempts"""
+        if self._reconnect_thread is not None and self._reconnect_thread.is_alive():
+            return  # Thread already running
+
+        self._stop_reconnect.clear()
+        self._reconnect_thread = threading.Thread(
+            target=self._reconnect_loop,
+            name="MQTT-Reconnect",
+            daemon=True
+        )
+        self._reconnect_thread.start()
+        self.log.info("MQTT reconnection thread started")
+
+    def _reconnect_loop(self):
+        """Background loop that attempts to reconnect to MQTT broker"""
+        while not self._stop_reconnect.is_set():
+            if not self.connected:
+                self.log.debug("Attempting MQTT reconnection...")
+                if self._try_connect():
+                    self.log.info("MQTT reconnected successfully")
+                    break
+
+            # Wait before next attempt
+            self._stop_reconnect.wait(RECONNECT_CHECK_INTERVAL)
 
     def disconnect(self):
         """Gracefully disconnect from MQTT broker"""
+        # Stop reconnection thread
+        self._stop_reconnect.set()
+        if self._reconnect_thread is not None and self._reconnect_thread.is_alive():
+            self._reconnect_thread.join(timeout=2)
+
         try:
             self.client.loop_stop()
             self.client.disconnect()

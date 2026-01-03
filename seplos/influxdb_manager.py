@@ -6,6 +6,12 @@ import time
 import threading
 from .logging_setup import get_logger
 
+# Retry configuration
+RETRY_MAX_ATTEMPTS = 10
+RETRY_INITIAL_DELAY = 2  # seconds
+RETRY_MAX_DELAY = 60  # seconds
+RETRY_BACKOFF_FACTOR = 2
+
 
 class InfluxDBManager:
     """
@@ -50,10 +56,10 @@ class InfluxDBManager:
         self.reconnect_count = 0
 
         if self.enabled and self.url and self.token:
-            self._setup_client()
+            self._setup_client_with_retry()
 
     def _setup_client(self):
-        """Setup InfluxDB client with retry logic"""
+        """Setup InfluxDB client"""
         try:
             from influxdb_client import InfluxDBClient, WriteOptions
 
@@ -68,16 +74,49 @@ class InfluxDBManager:
                 max_retry_delay=30_000,
                 exponential_base=2
             ))
-            self.connected = True
-            self.reconnect_attempts = 0
-            self.reconnect_delay = 5
-            self.log.info(f"InfluxDB connected to {self.url}, bucket: {self.bucket}, mode: {self.publish_mode}")
+
+            # Test connection with health check
+            health = self.client.health()
+            if health.status == "pass":
+                self.connected = True
+                self.reconnect_attempts = 0
+                self.reconnect_delay = 5
+                self.log.info(f"InfluxDB connected to {self.url}, bucket: {self.bucket}, mode: {self.publish_mode}")
+            else:
+                self.log.warning(f"InfluxDB health check failed: {health.message}")
+                self.connected = False
         except ImportError:
             self.log.warning("influxdb-client not installed. InfluxDB disabled.")
             self.enabled = False
         except Exception as e:
-            self.log.error(f"InfluxDB connection error: {e}")
+            self.log.warning(f"InfluxDB connection failed: {e}")
             self.connected = False
+
+    def _setup_client_with_retry(self):
+        """Setup InfluxDB client with retry logic at startup"""
+        delay = RETRY_INITIAL_DELAY
+
+        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+            self._setup_client()
+
+            if self.connected:
+                return  # Successfully connected
+
+            if not self.enabled:
+                return  # influxdb-client not installed
+
+            if attempt < RETRY_MAX_ATTEMPTS:
+                self.log.info(
+                    f"InfluxDB connection attempt {attempt}/{RETRY_MAX_ATTEMPTS} failed, "
+                    f"retrying in {delay}s..."
+                )
+                time.sleep(delay)
+                delay = min(delay * RETRY_BACKOFF_FACTOR, RETRY_MAX_DELAY)
+
+        self.log.warning(
+            f"InfluxDB: all {RETRY_MAX_ATTEMPTS} connection attempts failed. "
+            "Will retry on next write operation."
+        )
 
     def _try_reconnect(self):
         """Attempt to reconnect with exponential backoff"""

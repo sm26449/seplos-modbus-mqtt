@@ -5,6 +5,25 @@ All notable changes to Seplos BMS MQTT will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1] - 2026-01-04
+
+### Added
+- **MQTT Connection Retry Logic**
+  - Retry with exponential backoff at startup (10 attempts, 2s to 60s delay)
+  - Background reconnection thread if initial connection fails
+  - Automatic reconnection every 30 seconds until successful
+  - Graceful thread cleanup on shutdown
+
+- **InfluxDB Connection Retry Logic**
+  - Retry with exponential backoff at startup (10 attempts, 2s to 60s delay)
+  - Health check verification before marking as connected
+  - Existing lazy reconnect in is_enabled() still works for runtime failures
+
+### Fixed
+- MQTT connection failures on container restart no longer cause immediate exit
+- InfluxDB connection failures on container restart no longer prevent startup
+- Services continue operating while attempting reconnection to unavailable backends
+
 ## [2.5.0] - 2024-12-03
 
 ### Added
