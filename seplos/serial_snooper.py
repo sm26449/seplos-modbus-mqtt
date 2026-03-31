@@ -526,6 +526,7 @@ class SerialSnooper:
         power_raw = (readData[50] << 8) | readData[51]
         power_celsius = round(power_raw / 10.0 - 273.15, 1)
         self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/mosfet_temp", power_celsius)
+        self.pack_aggregator.update_battery_data(unitIdentifier, 'mosfet_temp', power_celsius)
 
         # Publicăm last_update la fiecare pachet primit (PIB)
         last_update = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
