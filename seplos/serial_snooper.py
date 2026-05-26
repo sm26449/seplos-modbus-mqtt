@@ -12,6 +12,32 @@ from .logging_setup import get_logger
 from .utils import calc_crc16, to_lower_under
 
 
+# ── Physical bounds for sanity checks (LiFePO4, Seplos V3, 16S pack) ──
+# Added 2026-05-26 after audit found CRC-passed but byte-corrupt frames
+# leaking impossible values (cell_V=6.342V, SOC=121%, unit_id=116) into
+# MQTT and InfluxDB. CRC-16 at this bus rate (~40M frames/2mo) has a
+# birthday-paradox false-positive rate of ~1/65536, so a bit-corrupt
+# stream can occasionally pass CRC by chance. Range checks are a cheap
+# second line of defence.
+MAX_PACK_ID = 16            # Seplos addresses 1..16; anything else = bogus
+CELL_V_MIN = 2.000          # LiFePO4 deep-discharge cutoff
+CELL_V_MAX = 4.000          # LFP nominal 3.65V; over-voltage trip well below 4.0
+PACK_V_MIN = 32.0           # 16S × 2.0V floor
+PACK_V_MAX = 64.0           # 16S × 4.0V ceiling
+TEMP_C_MIN = -40.0          # below this = unplugged sensor / 0xFFFF
+TEMP_C_MAX = 100.0          # above this = sensor fault
+SOC_MIN_PCT = 0.0
+SOC_MAX_PCT = 110.0         # Seplos transient overshoot up to ~101.5% on full charge
+SOH_MIN_PCT = 50.0          # below this is end-of-life territory; below ~70% never seen via PIA
+SOH_MAX_PCT = 110.0
+CYCLES_MAX = 10000          # rated 6000 to 80% SOH; >10k physically implausible
+CURRENT_A_MAX = 500.0       # Seplos rated 100-200A; >500A = bit-rot
+
+# Frame consistency tolerances (cross-field checks)
+CELL_DELTA_TOL_MV = 50      # cell_delta reported should equal (max-min)*1000 ± 50mV
+POWER_TOL_W = 500           # power should equal -current*voltage ± 500W
+
+
 class SerialSnooper:
     """
     Serial Snooper class - sniffs Modbus RTU traffic from Seplos BMS
@@ -45,10 +71,27 @@ class SerialSnooper:
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
 
-        # Timeout optimizat: 0.1s reduce consumul CPU semnificativ
-        # La 19200 baud, un frame Modbus de 100 bytes ia ~52ms
-        # Timeout de 100ms permite acumularea datelor și reduce ciclurile idle
-        self.serial_timeout = 0.1
+        # ── Serial timing (audit 2026-05-26) ──────────────────────────
+        # Read-block timeout = 0.5s (CPU-friendly idle, plenty for any
+        # single Modbus exchange to complete).
+        # Inter-byte timeout = 2.0ms = 3.5-char gap @ 19200 baud (the
+        # Modbus RTU spec's frame-boundary criterion). When the bus
+        # stays idle for >2ms, pyserial.read() returns immediately with
+        # whatever it has buffered — giving us exact frame boundaries
+        # instead of the prior 100ms blob-of-frames approach.
+        # The 100ms-idle framing was the root cause of the
+        # birthday-paradox CRC collisions found in the audit.
+        self.serial_timeout = 0.5
+        self.inter_byte_timeout = 0.002
+
+        # CRC-dedup ring of recent (crc, len, unit_id, fc) tuples — a
+        # frame seen within the last `_dedup_n` parsed frames is dropped
+        # silently. Belt-and-braces against the "sliding window in
+        # stuck buffer" pattern the audit identified (same 36-byte
+        # chunk re-parsed multiple times across different packs over
+        # different days).
+        self._dedup_n = 64
+        self._dedup_ring: list[tuple] = []
 
         # Initial connection
         self._connect_serial()
@@ -60,15 +103,28 @@ class SerialSnooper:
         self.close()
 
     def _connect_serial(self):
-        """Connect to serial port with logging"""
-        self.log.info(f"Opening serial interface, port: {self.port} {self.baudrate} 8N1 timeout: {self.serial_timeout}")
+        """Connect to serial port with logging.
+
+        ``inter_byte_timeout`` enforces Modbus RTU's 3.5-character gap
+        (~2ms @ 19200) as the frame-boundary criterion — read() returns
+        as soon as the bus is idle for that long, giving us exact frame
+        delimitation. Without this, the prior 100ms-idle approach
+        regularly merged multiple back-to-back slave responses into
+        one buffer pass, which let the parser pick up CRC-by-chance
+        false-positive frames.
+        """
+        self.log.info(
+            f"Opening serial interface, port: {self.port} {self.baudrate} "
+            f"8N1 timeout={self.serial_timeout}s inter_byte={self.inter_byte_timeout*1000:.1f}ms"
+        )
         self.connection = serial.Serial(
             port=self.port,
             baudrate=self.baudrate,
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=self.serial_timeout
+            timeout=self.serial_timeout,
+            inter_byte_timeout=self.inter_byte_timeout,
         )
         self.current_reconnect_delay = self.reconnect_delay  # Reset delay on successful connect
         self.log.debug(self.connection)
@@ -293,9 +349,20 @@ class SerialSnooper:
                                     self.trashdataf += "]"
                                 responce = True
 
-                                # Pack Alarms and Status (PIC - 0x1200) - 18 bytes
-                                if readByteCount == 18:
-                                    self._process_alarm_status(unitIdentifier, readData)
+                                # CRC-dedup: a sliding window of the last
+                                # `_dedup_n` accepted frames. Drop if the
+                                # exact (crc, len, unit, fc) tuple was
+                                # already parsed recently — the audit
+                                # found the same 18-byte chunk getting
+                                # re-parsed on stuck-buffer re-entry.
+                                fp = (crc16, readByteCount, unitIdentifier, 1)
+                                if fp not in self._dedup_ring:
+                                    self._dedup_ring.append(fp)
+                                    if len(self._dedup_ring) > self._dedup_n:
+                                        self._dedup_ring.pop(0)
+                                    # Pack Alarms and Status (PIC - 0x1200) - 18 bytes
+                                    if readByteCount == 18:
+                                        self._process_alarm_status(unitIdentifier, readData)
 
                                 modbusdata = modbusdata[bufferIndex:]
                                 bufferIndex = 0
@@ -327,13 +394,19 @@ class SerialSnooper:
                                     self.trashdataf += "]"
                                 responce = True
 
-                                # Cell Pack information (PIB - 0x1100) - 52 bytes
-                                if readByteCount == 52:
-                                    self._process_cell_info(unitIdentifier, readData)
+                                # CRC-dedup (see FC01 branch above).
+                                fp = (crc16, readByteCount, unitIdentifier, 4)
+                                if fp not in self._dedup_ring:
+                                    self._dedup_ring.append(fp)
+                                    if len(self._dedup_ring) > self._dedup_n:
+                                        self._dedup_ring.pop(0)
+                                    # Cell Pack information (PIB - 0x1100) - 52 bytes
+                                    if readByteCount == 52:
+                                        self._process_cell_info(unitIdentifier, readData)
 
-                                # Pack Main information (PIA - 0x1000) - 36 bytes
-                                if readByteCount == 36:
-                                    self._process_main_info(unitIdentifier, readData)
+                                    # Pack Main information (PIA - 0x1000) - 36 bytes
+                                    if readByteCount == 36:
+                                        self._process_main_info(unitIdentifier, readData)
 
                                 modbusdata = modbusdata[bufferIndex:]
                                 bufferIndex = 0
@@ -356,8 +429,27 @@ class SerialSnooper:
                 modbusdata = modbusdata[bufferIndex:]
                 bufferIndex = 0
 
+    def _is_valid_unit(self, unitIdentifier):
+        """Return True if unitIdentifier is in the physical pack-id range.
+
+        Seplos addresses 1..16. Anything else is a CRC-passed but
+        byte-corrupt frame (we've seen unit_id=116 / 0x74 in the wild)
+        and must be dropped silently — autodiscover would otherwise
+        publish a phantom pack to MQTT and Home Assistant.
+        """
+        if not (1 <= unitIdentifier <= MAX_PACK_ID):
+            self.log.warning(
+                "Drop frame: invalid unit_id=%d (0x%02x) — outside [1..%d]. "
+                "Likely CRC-collision on bus-arbitration boundary.",
+                unitIdentifier, unitIdentifier, MAX_PACK_ID,
+            )
+            return False
+        return True
+
     def _process_alarm_status(self, unitIdentifier, readData):
         """Process FC01 alarm and status response (18 bytes)"""
+        if not self._is_valid_unit(unitIdentifier):
+            return
         if unitIdentifier not in self.batts_declared_set:
             self.autodiscovery_battery(unitIdentifier)
             self.batts_declared_set.add(unitIdentifier)
@@ -496,37 +588,63 @@ class SerialSnooper:
 
     def _process_cell_info(self, unitIdentifier, readData):
         """Process FC04 cell information response (52 bytes)"""
-        if unitIdentifier not in self.batts_declared_set:
-            self.autodiscovery_battery(unitIdentifier)
-            self.batts_declared_set.add(unitIdentifier)
+        if not self._is_valid_unit(unitIdentifier):
+            return
 
-        # Cell voltages 1-16 (bytes 0-31) - calculăm o singură dată
+        # Pre-compute and validate all 16 cell voltages BEFORE publishing
+        # anything. If any is out of physical range, drop the WHOLE frame
+        # — partial publish would leave one bad value visible in MQTT and
+        # let the pack aggregator broadcast a corrupt max/min/delta.
         cell_voltages = []
         for i in range(0, 32, 2):
             celda = round(((readData[i] << 8) | readData[i + 1]) / 1000.0, 3)
             cell_voltages.append(celda)
-            cell_num = (i // 2) + 1
-            self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/cell_{cell_num}", celda)
-            self.pack_aggregator.update_battery_data(unitIdentifier, f'cell_{cell_num}', celda)
-
-        # Cell temperatures 1-4 (bytes 32-39) - calculăm o singură dată
+        for idx, v in enumerate(cell_voltages, start=1):
+            if not (CELL_V_MIN <= v <= CELL_V_MAX):
+                self.log.warning(
+                    "Drop PIB frame: pack=%d cell_%d=%.3fV outside "
+                    "[%.1f, %.1f] — CRC-passed but byte-corrupt.",
+                    unitIdentifier, idx, v, CELL_V_MIN, CELL_V_MAX,
+                )
+                return
+        # Cell temperatures + ambient + mosfet — drop if any out of range.
+        cell_temps = []
         for i in range(4):
             temp_raw = (readData[32 + i*2] << 8) | readData[33 + i*2]
-            temp_celsius = round(temp_raw / 10.0 - 273.15, 1)
-            self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/cell_temp_{i+1}", temp_celsius)
-            self.pack_aggregator.update_battery_data(unitIdentifier, f'cell_temp_{i+1}', temp_celsius)
-
-        # Ambient temperature (bytes 48-49)
+            temp_c = round(temp_raw / 10.0 - 273.15, 1)
+            cell_temps.append(temp_c)
+            if not (TEMP_C_MIN <= temp_c <= TEMP_C_MAX):
+                self.log.warning(
+                    "Drop PIB frame: pack=%d cell_temp_%d=%.1f°C out of range",
+                    unitIdentifier, i+1, temp_c)
+                return
         ambient_raw = (readData[48] << 8) | readData[49]
-        ambient_celsius = round(ambient_raw / 10.0 - 273.15, 1)
-        self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/ambient_temp", ambient_celsius)
-        self.pack_aggregator.update_battery_data(unitIdentifier, 'ambient_temp', ambient_celsius)
-
-        # MOSFET temperature (bytes 50-51)
+        ambient_c = round(ambient_raw / 10.0 - 273.15, 1)
         power_raw = (readData[50] << 8) | readData[51]
-        power_celsius = round(power_raw / 10.0 - 273.15, 1)
-        self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/mosfet_temp", power_celsius)
-        self.pack_aggregator.update_battery_data(unitIdentifier, 'mosfet_temp', power_celsius)
+        mosfet_c = round(power_raw / 10.0 - 273.15, 1)
+        if not (TEMP_C_MIN <= ambient_c <= TEMP_C_MAX) \
+                or not (TEMP_C_MIN <= mosfet_c <= TEMP_C_MAX):
+            self.log.warning(
+                "Drop PIB frame: pack=%d ambient=%.1f mosfet=%.1f out of range",
+                unitIdentifier, ambient_c, mosfet_c)
+            return
+
+        # Autodiscover only after validation passed.
+        if unitIdentifier not in self.batts_declared_set:
+            self.autodiscovery_battery(unitIdentifier)
+            self.batts_declared_set.add(unitIdentifier)
+
+        # All-clear → publish.
+        for idx, celda in enumerate(cell_voltages, start=1):
+            self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/cell_{idx}", celda)
+            self.pack_aggregator.update_battery_data(unitIdentifier, f'cell_{idx}', celda)
+        for i, temp_c in enumerate(cell_temps):
+            self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/cell_temp_{i+1}", temp_c)
+            self.pack_aggregator.update_battery_data(unitIdentifier, f'cell_temp_{i+1}', temp_c)
+        self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/ambient_temp", ambient_c)
+        self.pack_aggregator.update_battery_data(unitIdentifier, 'ambient_temp', ambient_c)
+        self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/mosfet_temp", mosfet_c)
+        self.pack_aggregator.update_battery_data(unitIdentifier, 'mosfet_temp', mosfet_c)
 
         # Publicăm last_update la fiecare pachet primit (PIB)
         last_update = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -534,13 +652,12 @@ class SerialSnooper:
 
     def _process_main_info(self, unitIdentifier, readData):
         """Process FC04 main information response (36 bytes)"""
+        if not self._is_valid_unit(unitIdentifier):
+            return
+
         readDataNumber = []
         for i in range(0, 36, 2):
             readDataNumber.append((readData[i] << 8) | readData[i + 1])
-
-        if unitIdentifier not in self.batts_declared_set:
-            self.autodiscovery_battery(unitIdentifier)
-            self.batts_declared_set.add(unitIdentifier)
 
         # Pre-calculăm valorile o singură dată pentru a evita duplicarea
         pack_voltage = round(readDataNumber[0] / 100.0, 2)
@@ -562,6 +679,72 @@ class SerialSnooper:
         maxchgcurt = readDataNumber[16]
         power = int(round(-current * pack_voltage))
         cell_delta = readDataNumber[10] - readDataNumber[11]
+
+        # ── Validation (L1: range checks + L2: cross-field consistency) ──
+        # Drop the whole frame if ANY field is out of physical range.
+        # Catches CRC-passed byte-corrupt frames that leak impossible
+        # values (cell_max=6.342V, SOC=121%, cycles=25868) into MQTT/Influx.
+        # Single-pass list of (label, value, lo, hi):
+        checks = [
+            ('pack_voltage',     pack_voltage,        PACK_V_MIN,  PACK_V_MAX),
+            ('current',          abs(current),        0,           CURRENT_A_MAX),
+            ('soc',              soc,                 SOC_MIN_PCT, SOC_MAX_PCT),
+            ('soh',              soh,                 SOH_MIN_PCT, SOH_MAX_PCT),
+            ('cycles',           cycles,              0,           CYCLES_MAX),
+            ('avg_cell_v',       average_cell_voltage, CELL_V_MIN, CELL_V_MAX),
+            ('max_cell_v',       max_cell_voltage,    CELL_V_MIN,  CELL_V_MAX),
+            ('min_cell_v',       min_cell_voltage,    CELL_V_MIN,  CELL_V_MAX),
+            ('avg_cell_temp',    average_cell_temp,   TEMP_C_MIN,  TEMP_C_MAX),
+            ('max_cell_temp',    max_cell_temp,       TEMP_C_MIN,  TEMP_C_MAX),
+            ('min_cell_temp',    min_cell_temp,       TEMP_C_MIN,  TEMP_C_MAX),
+        ]
+        for label, val, lo, hi in checks:
+            if not (lo <= val <= hi):
+                self.log.warning(
+                    "Drop PIA frame: pack=%d %s=%s outside [%s, %s] — "
+                    "CRC-passed but byte-corrupt.",
+                    unitIdentifier, label, val, lo, hi,
+                )
+                return
+
+        # Cross-field consistency (L2):
+        #  - min_cell ≤ avg_cell ≤ max_cell
+        #  - cell_delta (raw mV) should equal (max-min)*1000 ± CELL_DELTA_TOL_MV
+        #  - min_temp ≤ avg_temp ≤ max_temp
+        #  - power ≈ -current * pack_voltage ± POWER_TOL_W
+        # Catches frames that pass per-field bounds but have internally
+        # inconsistent fields (different bytes corrupted in unrelated
+        # ways).
+        if not (min_cell_voltage <= average_cell_voltage <= max_cell_voltage):
+            self.log.warning(
+                "Drop PIA frame: pack=%d cell_v inconsistent "
+                "min=%.3f avg=%.3f max=%.3f",
+                unitIdentifier, min_cell_voltage, average_cell_voltage, max_cell_voltage)
+            return
+        expected_delta_mv = round((max_cell_voltage - min_cell_voltage) * 1000)
+        if abs(cell_delta - expected_delta_mv) > CELL_DELTA_TOL_MV:
+            self.log.warning(
+                "Drop PIA frame: pack=%d cell_delta=%d mV but max-min=%d mV "
+                "(tolerance %d mV)",
+                unitIdentifier, cell_delta, expected_delta_mv, CELL_DELTA_TOL_MV)
+            return
+        if not (min_cell_temp <= average_cell_temp <= max_cell_temp):
+            self.log.warning(
+                "Drop PIA frame: pack=%d cell_temp inconsistent "
+                "min=%.1f avg=%.1f max=%.1f",
+                unitIdentifier, min_cell_temp, average_cell_temp, max_cell_temp)
+            return
+        expected_power = -current * pack_voltage
+        if abs(power - expected_power) > POWER_TOL_W:
+            self.log.warning(
+                "Drop PIA frame: pack=%d power=%dW but -current*V=%.0fW "
+                "(tolerance %dW)",
+                unitIdentifier, power, expected_power, POWER_TOL_W)
+            return
+
+        if unitIdentifier not in self.batts_declared_set:
+            self.autodiscovery_battery(unitIdentifier)
+            self.batts_declared_set.add(unitIdentifier)
 
         # Publicăm pe MQTT
         prefix = f"{self.mqtt_prefix}/battery_{unitIdentifier}"
