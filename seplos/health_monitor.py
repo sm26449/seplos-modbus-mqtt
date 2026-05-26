@@ -1,14 +1,24 @@
 """
 Health Monitor - health checks, watchdog, and stale data detection
 """
+from __future__ import annotations  # Py 3.9 compat for `float | None` etc.
 
 import os
+import sys
 import time
 import threading
 from .logging_setup import get_logger
 
 # Health status file path (for Docker healthcheck)
 HEALTH_FILE = '/tmp/seplos_health'
+
+# Watchdog: exit (code 2) so Docker's `restart: unless-stopped` policy
+# kicks in if we've been running >GRACE seconds AND 0 batteries online
+# for >EMPTY_FAIL seconds. The grace period prevents a flap on first
+# boot (USB enumeration, bus warm-up); EMPTY_FAIL gives the master a
+# chance to come back from a brief silence.
+WATCHDOG_GRACE_S = 120         # 2 min from process start before watchdog arms
+WATCHDOG_EMPTY_FAIL_S = 300    # 5 min of "0 online" → exit + Docker restart
 
 
 class HealthMonitor:
@@ -41,6 +51,15 @@ class HealthMonitor:
         self.health_checks_performed = 0
         self.stale_batteries_detected = 0
         self.last_health_check = 0
+
+        # Watchdog state — earliest timestamp at which we saw "0 online".
+        # Reset to None as soon as we see at least one online battery.
+        self._zero_online_since: float | None = None
+
+        # Re-online edge tracker — batteries we've already marked
+        # "offline" via stale detection. On next fresh frame, emit
+        # "online" retained to clear the stale UI badge.
+        self._marked_offline: set = set()
 
     def set_declared_batteries(self, batteries_set):
         """Update the set of declared batteries"""
@@ -149,7 +168,13 @@ class HealthMonitor:
             self.log.debug(f"Failed to write health file: {e}")
 
     def _check_stale_batteries(self):
-        """Check for stale battery data and mark batteries as offline"""
+        """Check for stale battery data and mark batteries as offline.
+
+        Plus the recovery edge (audit 2026-05-26): when a previously-
+        offline battery starts publishing again, emit "online" retained
+        so the UI badge clears immediately instead of staying "offline"
+        until the next manual MQTT cleanup.
+        """
         if not self.pack_aggregator:
             return
 
@@ -164,10 +189,18 @@ class HealthMonitor:
             if time_since_update > self.stale_timeout:
                 stale_count += 1
                 # Mark battery as offline if it was previously declared
-                if batt_id in self.declared_batteries:
+                if batt_id in self.declared_batteries and batt_id not in self._marked_offline:
                     self.log.warning(f"Battery {batt_id} data stale ({int(time_since_update)}s), marking offline")
                     self.mqtt.publish(f"{self.mqtt_prefix}/battery_{batt_id}/state", "offline", retain=True)
+                    self._marked_offline.add(batt_id)
                     self.stale_batteries_detected += 1
+            else:
+                # Fresh data — if we'd previously marked it offline,
+                # republish "online" retained to clear the stale badge.
+                if batt_id in self._marked_offline:
+                    self.log.info(f"Battery {batt_id} recovered (last_update={int(time_since_update)}s ago) — marking online")
+                    self.mqtt.publish(f"{self.mqtt_prefix}/battery_{batt_id}/state", "online", retain=True)
+                    self._marked_offline.discard(batt_id)
 
         # Publish stale battery count
         if stale_count > 0:
@@ -179,6 +212,43 @@ class HealthMonitor:
         online_batteries = self.pack_aggregator.get_online_batteries(timeout=self.stale_timeout)
         self.mqtt.publish(f"{self.mqtt_prefix}/health/batteries_online", len(online_batteries), retain=True)
         self.mqtt.publish(f"{self.mqtt_prefix}/health/batteries_total", len(all_batteries), retain=True)
+
+        # Watchdog: if no battery has been online for >WATCHDOG_EMPTY_FAIL_S
+        # AND we're past the grace period, exit so Docker's restart
+        # policy kicks in. Previously the service could sit stuck for
+        # hours with 0 online — Docker `unless-stopped` only restarts
+        # on process exit (audit 2026-05-26).
+        self._check_watchdog(online_batteries, current_time)
+
+    def _check_watchdog(self, online_batteries, now):
+        """Exit the process if 0 batteries online >EMPTY_FAIL after GRACE."""
+        uptime = now - self.start_time
+        if uptime < WATCHDOG_GRACE_S:
+            return  # Boot grace
+        if online_batteries:
+            self._zero_online_since = None
+            return
+        if self._zero_online_since is None:
+            self._zero_online_since = now
+            self.log.warning(
+                "Watchdog: 0 batteries online (uptime=%ds, grace passed) — "
+                "starting %ds countdown to exit + restart",
+                int(uptime), WATCHDOG_EMPTY_FAIL_S,
+            )
+            return
+        elapsed = now - self._zero_online_since
+        if elapsed >= WATCHDOG_EMPTY_FAIL_S:
+            self.log.error(
+                "Watchdog: 0 batteries online for %ds — exiting (code 2). "
+                "Docker should restart us. Likely causes: USB unplugged, "
+                "BMS poller silent, RS485 bus dead.",
+                int(elapsed),
+            )
+            # Hard exit: do not run finally (the parser thread may still
+            # be holding the serial port lock and a clean shutdown would
+            # block on MQTT disconnect). os._exit bypasses cleanup; Docker
+            # picks it up as a non-zero exit and restarts per policy.
+            os._exit(2)
 
     def get_stats(self):
         """Return health monitor statistics"""

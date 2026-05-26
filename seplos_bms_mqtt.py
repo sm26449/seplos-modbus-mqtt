@@ -134,9 +134,15 @@ def main():
 
             log.info(f"Sniffer started on {port} @ {baudrate}. Listening for Seplos BMS data...")
 
-            while True:
+            # Main loop — checks shutdown flag set by signal_handler so
+            # we can drain Influx and stop everything cleanly via the
+            # finally block below (audit 2026-05-26: previously the
+            # signal handler called sys.exit() directly, which raced the
+            # batch flush).
+            while not sniffer.is_shutdown_requested():
                 data = sniffer.read_raw()
                 sniffer.process_data(data)
+            log.info("Shutdown flag set — draining")
 
     except KeyboardInterrupt:
         log.info("Shutdown requested...")
@@ -145,6 +151,16 @@ def main():
         log.error(f'Unexpected error: {e}')
         print_help()
     finally:
+        # Emit 'offline' retained per-battery so HA/UI badges clear,
+        # then stop background threads in dependency order. influxdb
+        # close() flushes the 10s batch — must run before mqtt
+        # disconnect (which would lose the in-flight publish for the
+        # batch summary).
+        try:
+            if 'sniffer' in locals():
+                sniffer.emit_offline_announcements()
+        except Exception as e:
+            log.debug(f"offline announce failed: {e}")
         if health_monitor:
             health_monitor.stop()
         if influxdb_manager:

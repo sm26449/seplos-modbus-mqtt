@@ -7,6 +7,7 @@ import sys
 import time
 import serial
 import json
+from collections import deque
 from datetime import datetime, timezone
 from .logging_setup import get_logger
 from .utils import calc_crc16, to_lower_under
@@ -84,14 +85,18 @@ class SerialSnooper:
         self.serial_timeout = 0.5
         self.inter_byte_timeout = 0.002
 
+        # Shutdown flag set by signal_handler; the main loop checks it.
+        self._shutdown_requested = False
+
         # CRC-dedup ring of recent (crc, len, unit_id, fc) tuples — a
-        # frame seen within the last `_dedup_n` parsed frames is dropped
+        # frame seen within the last 64 parsed frames is dropped
         # silently. Belt-and-braces against the "sliding window in
         # stuck buffer" pattern the audit identified (same 36-byte
         # chunk re-parsed multiple times across different packs over
-        # different days).
-        self._dedup_n = 64
-        self._dedup_ring: list[tuple] = []
+        # different days). ``deque(maxlen=64)`` is O(1) on the hot
+        # `append` path; the membership check is O(N=64) but the
+        # constant is tiny.
+        self._dedup_ring: deque = deque(maxlen=64)
 
         # Initial connection
         self._connect_serial()
@@ -185,13 +190,31 @@ class SerialSnooper:
         return self.batts_declared_set.copy()
 
     def signal_handler(self, sig, frame):
-        """Handle shutdown signals"""
+        """Handle shutdown signals (SIGTERM/SIGINT).
+
+        Sets ``self._shutdown_requested`` so the main loop in
+        ``seplos_bms_mqtt.main()`` exits cleanly and ``main()``'s
+        ``finally`` block runs — flushing InfluxDB's 10s batch and
+        stopping the health monitor in order.
+
+        Previously this handler called ``sys.exit(0)`` directly, which
+        works but races with the InfluxDB batch flush (write_api flushes
+        only when close() is called — sys.exit through a try/finally
+        runs close() but in the wrong thread vs the I/O batch).
+        Audit 2026-05-26.
+        """
+        self.log.info("Shutdown signal received (signal=%d) — draining and exiting", sig)
+        self._shutdown_requested = True
+
+    def is_shutdown_requested(self):
+        return self._shutdown_requested
+
+    def emit_offline_announcements(self):
+        """Publish 'offline' retained for every declared battery before
+        the broker disconnect. Called from ``main()`` finally block."""
         for batt_number in self.batts_declared_set:
             self.log.info(f"Sending offline signal for Battery {batt_number}")
             self.mqtt.publish(f"{self.mqtt_prefix}/battery_{batt_number}/state", "offline", retain=True)
-        self.mqtt.disconnect()
-        print('\nGoodbye\n')
-        sys.exit(0)
 
     def process_data(self, data):
         """Buffer data and attempt to decode on every chunk.
@@ -371,16 +394,15 @@ class SerialSnooper:
                                 responce = True
 
                                 # CRC-dedup: a sliding window of the last
-                                # `_dedup_n` accepted frames. Drop if the
-                                # exact (crc, len, unit, fc) tuple was
-                                # already parsed recently — the audit
-                                # found the same 18-byte chunk getting
-                                # re-parsed on stuck-buffer re-entry.
+                                # 64 accepted frames (deque maxlen).
+                                # Drop if the exact (crc, len, unit, fc)
+                                # tuple was already parsed recently —
+                                # audit found the same 18-byte chunk
+                                # getting re-parsed on stuck-buffer
+                                # re-entry.
                                 fp = (crc16, readByteCount, unitIdentifier, 1)
                                 if fp not in self._dedup_ring:
                                     self._dedup_ring.append(fp)
-                                    if len(self._dedup_ring) > self._dedup_n:
-                                        self._dedup_ring.pop(0)
                                     # Pack Alarms and Status (PIC - 0x1200) - 18 bytes
                                     if readByteCount == 18:
                                         self._process_alarm_status(unitIdentifier, readData)
@@ -419,8 +441,6 @@ class SerialSnooper:
                                 fp = (crc16, readByteCount, unitIdentifier, 4)
                                 if fp not in self._dedup_ring:
                                     self._dedup_ring.append(fp)
-                                    if len(self._dedup_ring) > self._dedup_n:
-                                        self._dedup_ring.pop(0)
                                     # Cell Pack information (PIB - 0x1100) - 52 bytes
                                     if readByteCount == 52:
                                         self._process_cell_info(unitIdentifier, readData)
@@ -490,7 +510,7 @@ class SerialSnooper:
         # Bytes 6-7: Cell balancing status
         balancing_bits = (readData[7] << 8) | readData[6]
         self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/balancing_bits", balancing_bits)
-        balancing_count = bin(balancing_bits).count('1')
+        balancing_count = bin(balancing_bits).count('1')  # Py 3.10+ .bit_count() not available on 3.9 base image
         self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/balancing_count", balancing_count)
         balancing_cells = [i+1 for i in range(16) if (balancing_bits >> i) & 1]
         self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/balancing_cells",
@@ -590,9 +610,17 @@ class SerialSnooper:
         ])
         self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/protection_count", protection_count)
 
-        # Failure summary
+        # Failure summary + individual bits (audit 2026-05-26: previously
+        # only the count was published — operator couldn't tell WHICH
+        # failure bit was set. Each bit is its own MQTT topic now so
+        # alertd rules can subscribe to specific failure modes.)
         failure_count = sum([failure_ntc, failure_afe, failure_charge_mosfet, failure_discharge_mosfet, failure_cell_diff])
         self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/failure_count", failure_count)
+        self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/failure_ntc", failure_ntc)
+        self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/failure_afe", failure_afe)
+        self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/failure_charge_mosfet", failure_charge_mosfet)
+        self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/failure_discharge_mosfet", failure_discharge_mosfet)
+        self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/failure_cell_diff", failure_cell_diff)
 
         # Heating status
         self.mqtt.publish_if_changed(f"{self.mqtt_prefix}/battery_{unitIdentifier}/heating_active", "ON" if alarm_heating_active else "OFF")

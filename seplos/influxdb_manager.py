@@ -165,10 +165,32 @@ class InfluxDBManager:
         return False
 
     def is_enabled(self):
-        """Check if InfluxDB is enabled and connected"""
+        """Check if InfluxDB is enabled and connected.
+
+        Non-blocking — schedules a background reconnect when needed
+        instead of blocking the caller (audit 2026-05-26: this was on
+        the serial-decode hot path; a 30 s Influx hang stalled frame
+        parsing and risked timeouts upstream).
+        """
         if self.enabled and not self.connected:
-            self._try_reconnect()
+            self._schedule_async_reconnect()
         return self.enabled and self.connected
+
+    def _schedule_async_reconnect(self):
+        """Kick off a reconnect attempt in a background thread iff
+        none is already running. Backoff is enforced inside
+        _try_reconnect by ``self.reconnect_delay``."""
+        # Lock-free atomic check is fine here — at worst we spawn one
+        # extra thread which immediately no-ops via the backoff guard.
+        t = getattr(self, '_reconnect_thread', None)
+        if t is not None and t.is_alive():
+            return
+        self._reconnect_thread = threading.Thread(
+            target=self._try_reconnect,
+            daemon=True,
+            name="InfluxDB-Reconnect",
+        )
+        self._reconnect_thread.start()
 
     def _should_write(self, key, data):
         """Check if data should be written based on publish_mode"""
@@ -215,12 +237,17 @@ class InfluxDBManager:
         self.writes_total += 1
 
         try:
-            from influxdb_client import Point
+            from influxdb_client import Point, WritePrecision
 
-            # Create point for battery measurements
+            # Cardinality cleanup (audit 2026-05-26):
+            #  - dropped `device` tag (was always `battery_<id>` —
+            #    100% redundant with `battery_id`).
+            #  - `status` is now a FIELD, not a tag (was creating a new
+            #    series per Charge/Discharge/Floating/Full/Standby/Off
+            #    transition × 16 packs).
+            # Write precision dropped from ns to ms — saves ~20% TSI.
             point = Point("seplos_battery") \
-                .tag("battery_id", str(battery_id)) \
-                .tag("device", f"battery_{battery_id}")
+                .tag("battery_id", str(battery_id))
 
             # Add all numeric fields
             numeric_fields = [
@@ -249,11 +276,15 @@ class InfluxDBManager:
                 if temp_key in data and data[temp_key] is not None:
                     point = point.field(temp_key, float(data[temp_key]))
 
-            # Add status as tag
-            if 'status' in data:
-                point = point.tag("status", data['status'])
+            # `status` as field (string) — was previously a tag, which
+            # creates a new series per value and blows up TSI over time.
+            if 'status' in data and data['status']:
+                point = point.field("status", str(data['status']))
 
-            self.write_api.write(bucket=self.bucket, org=self.org, record=point)
+            self.write_api.write(
+                bucket=self.bucket, org=self.org, record=point,
+                write_precision=WritePrecision.MS,
+            )
             self.last_successful_write = current_time
 
         except Exception as e:
@@ -283,10 +314,12 @@ class InfluxDBManager:
         self.writes_total += 1
 
         try:
-            from influxdb_client import Point
+            from influxdb_client import Point, WritePrecision
 
-            point = Point("seplos_pack") \
-                .tag("device", "pack_aggregate")
+            # `device` tag dropped — pack_aggregate measurement is
+            # already identified by the measurement name `seplos_pack`,
+            # the tag added nothing. (Audit 2026-05-26.)
+            point = Point("seplos_pack")
 
             # Add all pack fields
             pack_fields = [
@@ -307,11 +340,14 @@ class InfluxDBManager:
                     if isinstance(value, (int, float)):
                         point = point.field(field, float(value))
 
-            # Add status as tag
-            if 'status' in data:
-                point = point.tag("status", data['status'])
+            # `status` as field (was a tag — cardinality blow-up).
+            if 'status' in data and data['status']:
+                point = point.field("status", str(data['status']))
 
-            self.write_api.write(bucket=self.bucket, org=self.org, record=point)
+            self.write_api.write(
+                bucket=self.bucket, org=self.org, record=point,
+                write_precision=WritePrecision.MS,
+            )
             self.last_successful_write = current_time
 
         except Exception as e:
