@@ -156,6 +156,14 @@ class InfluxDBManager:
             if self.connected:
                 self.reconnect_count += 1
                 self.log.info("InfluxDB reconnected successfully")
+                # Invalidate the _should_write cache so next batch of
+                # writes flows through (broker/server may have lost
+                # any in-flight points during the outage).
+                # Audit 2026-05-26.
+                with self.lock:
+                    n = len(self.last_values)
+                    self.last_values.clear()
+                self.log.info("InfluxDB reconnect: cleared %d cached values for republish", n)
                 return True
         except Exception as e:
             self.log.error(f"InfluxDB reconnect failed: {e}")

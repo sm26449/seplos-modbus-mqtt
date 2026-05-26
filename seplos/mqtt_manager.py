@@ -89,6 +89,7 @@ class MQTTManager:
     def _on_connect(self, client, userdata, flags, reason_code, properties=None):
         """Callback when connected to MQTT broker"""
         if reason_code == 0:
+            was_reconnect = self.connection_count > 0
             self.connected = True
             self.connection_count += 1
             self.reconnect_attempts = 0
@@ -98,6 +99,16 @@ class MQTTManager:
             # Subscribe to command topic for on-demand requests
             self.client.subscribe(self._command_topic)
             self.log.info(f"Subscribed to command topic: {self._command_topic}")
+            # On reconnect (not first connect), invalidate the
+            # publish_if_changed cache so every next publish flows
+            # through — broker may have lost retained state during the
+            # outage, and HA/UI subscribers need a fresh state push.
+            # Audit 2026-05-26.
+            if was_reconnect:
+                with self.lock:
+                    n = len(self.last_values)
+                    self.last_values.clear()
+                self.log.info("MQTT reconnect: cleared %d cached values to force republish", n)
         else:
             self.connected = False
             self.log.error(f"MQTT connection failed with code: {reason_code}")
