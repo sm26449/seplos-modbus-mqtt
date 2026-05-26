@@ -194,13 +194,34 @@ class SerialSnooper:
         sys.exit(0)
 
     def process_data(self, data):
-        """Buffer data and decode when interframe timeout occurs"""
-        if len(data) <= 0:
-            if len(self.data) > 2:
-                self.data = self._decode_modbus(self.data)
-            return
-        for dat in data:
-            self.data.append(dat)
+        """Buffer data and attempt to decode on every chunk.
+
+        With ``inter_byte_timeout=2ms`` (Modbus RTU 3.5-char gap),
+        ``serial.read()`` returns as soon as the bus idles between
+        frames — so on a continuously-polled 16-pack bus, read() will
+        almost NEVER return empty bytes. The previous "decode only on
+        empty read" pattern (which worked when timeout was 100ms) left
+        the buffer growing forever after the inter-byte change shipped
+        in commit ed6dc86 — service ran but produced ZERO output.
+
+        Fix: always extend the buffer with new bytes, then try to
+        decode. ``_decode_modbus`` is internally idempotent — it
+        consumes bytes only when a CRC-valid frame is found, otherwise
+        returns whatever it couldn't parse. Plus a hard cap to prevent
+        unbounded growth if the parser is somehow stuck.
+        """
+        if data:
+            self.data.extend(data)
+        if len(self.data) > 2:
+            self.data = self._decode_modbus(self.data)
+        # Safety: a runaway buffer means decoder is stuck on garbage.
+        # 4 KB is ~20× the largest Seplos frame (52-byte PIB + headers);
+        # anything beyond that is noise that won't ever parse cleanly.
+        if len(self.data) > 4096:
+            self.log.warning(
+                "Buffer overflow guard: dropping %dB of unparseable data",
+                len(self.data))
+            self.data = bytearray()
 
     def autodiscovery_battery(self, unitIdentifier):
         """Send MQTT autodiscovery for a battery"""
